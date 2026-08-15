@@ -408,14 +408,14 @@
             .trim();
     }
 
-    function processContentReferences(text, contentReferences) {
+    function processContentReferences(text, contentReferences, referenceStartIndex = 1) {
         if (!text || !Array.isArray(contentReferences) || contentReferences.length === 0) {
-            return { text, footnotes: [] };
+            return { text, footnotes: [], nextReferenceIndex: referenceStartIndex };
         }
 
         const references = contentReferences.filter(ref => ref && typeof ref.matched_text === 'string' && ref.matched_text.length > 0);
         if (references.length === 0) {
-            return { text, footnotes: [] };
+            return { text, footnotes: [], nextReferenceIndex: referenceStartIndex };
         }
 
         const getReferenceInfo = (ref) => {
@@ -446,7 +446,7 @@
             if (!info.url) return;
             const key = `${info.url}|${info.title}`;
             if (footnoteIndexByKey.has(key)) return;
-            const index = footnotes.length + 1;
+            const index = referenceStartIndex + footnotes.length;
             footnoteIndexByKey.set(key, index);
             footnotes.push({ index, url: info.url, title: info.title, label: info.label });
         });
@@ -488,12 +488,17 @@
             output = output.split(ref.matched_text).join(replacement);
         });
 
-        return { text: output, footnotes };
+        return {
+            text: output,
+            footnotes,
+            nextReferenceIndex: referenceStartIndex + footnotes.length
+        };
     }
 
     function extractConversationMessages(convData, attachmentResult = null) {
         const messages = [];
         const nodes = getActiveConversationNodes(convData);
+        let nextReferenceIndex = 1;
 
         nodes.forEach(node => {
             const msg = node?.message;
@@ -515,9 +520,10 @@
             let processedText = rawText;
             let footnotes = [];
             if (Array.isArray(contentReferences) && contentReferences.length > 0) {
-                const processed = processContentReferences(rawText, contentReferences);
+                const processed = processContentReferences(rawText, contentReferences, nextReferenceIndex);
                 processedText = processed.text;
                 footnotes = processed.footnotes;
+                nextReferenceIndex = processed.nextReferenceIndex;
             }
 
             const cleaned = cleanMessageContent(
