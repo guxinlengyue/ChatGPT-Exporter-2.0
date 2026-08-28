@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         ChatGPT Universal Exporter (Markdown Support)
-// @version      1.4.0
+// @version      1.5.0
 // @description  Export ChatGPT conversations with visible uploads and generated files as JSON+Markdown ZIP backups.
 // @author       huhu
 // @match        https://chatgpt.com/*
@@ -14,6 +14,16 @@
 // @downloadURL  https://update.greasyfork.org/scripts/556233/ChatGPT%20Universal%20Exporter%20(Markdown%20Support).user.js
 // @updateURL    https://update.greasyfork.org/scripts/556233/ChatGPT%20Universal%20Exporter%20(Markdown%20Support).meta.js
 // ==/UserScript==
+
+/* ============================================================
+    v1.5.0 变更 (悬浮按钮重设计)
+    ------------------------------------------------------------
+    • 宽文字按钮改为 44px 紧凑悬浮球，竖屏不再遮挡发送按钮
+    • 支持拖动到任意位置（localStorage 记忆），拖近左右边缘自动吸附
+    • 贴边后空闲 2.5 秒半隐藏为侧边把手，hover/点按展开
+    • 导出进度以环形进度 + 百分比显示在悬浮球上，明细显示在旁边状态气泡
+    • 适配深色模式；右键点击可重置位置
+    ========================================================== */
 
 /* ============================================================
     v1.4.0 变更 (新增附件与多模态导出)
@@ -155,7 +165,7 @@
             : `${jsonName}.md`;
     }
 
-    const ATTACHMENT_EXPORT_VERSION = '1.4.0';
+    const ATTACHMENT_EXPORT_VERSION = '1.5.0';
     const EXPORT_BUTTON_LABEL = `Export Conversations v${ATTACHMENT_EXPORT_VERSION}`;
     const MIME_EXTENSIONS = {
         'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
@@ -580,18 +590,412 @@
         URL.revokeObjectURL(a.href);
     }
 
-    // --- 导出流程核心逻辑 ---
-    function getExportButton() {
+    // --- 悬浮导出按钮（紧凑悬浮球：可拖动、位置记忆、贴边半隐藏） ---
+    const FAB_SIZE = 44;
+    const FAB_DRAG_THRESHOLD = 6;
+    const FAB_EDGE_SNAP = 36;
+    const FAB_STORAGE_KEY = 'chatgpt-exporter-fab-v1';
+    const FAB_ICON_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+
+    const fabState = { x: null, y: null, docked: null, collapsed: false };
+    let fabDragInfo = null;
+    let fabSuppressClick = false;
+    let fabCollapseTimer = null;
+
+    function fabDefaultPosition() {
+        return { x: window.innerWidth - FAB_SIZE / 2 - 14, y: Math.round(window.innerHeight * 0.45) };
+    }
+
+    function fabClamp(pos) {
+        const half = FAB_SIZE / 2;
+        return {
+            x: Math.min(Math.max(pos.x, half + 2), Math.max(half + 2, window.innerWidth - half - 2)),
+            y: Math.min(Math.max(pos.y, half + 2), Math.max(half + 2, window.innerHeight - half - 2))
+        };
+    }
+
+    function fabSnap(pos) {
+        const half = FAB_SIZE / 2;
+        const snapped = { ...pos };
+        fabState.docked = null;
+        if (pos.x <= half + FAB_EDGE_SNAP) {
+            snapped.x = half + 2;
+            fabState.docked = 'left';
+        } else if (pos.x >= window.innerWidth - half - FAB_EDGE_SNAP) {
+            snapped.x = window.innerWidth - half - 2;
+            fabState.docked = 'right';
+        }
+        return snapped;
+    }
+
+    function loadFabState() {
+        try {
+            const saved = JSON.parse(localStorage.getItem(FAB_STORAGE_KEY));
+            if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') return saved;
+        } catch (_) {}
+        return null;
+    }
+
+    function saveFabState() {
+        try {
+            localStorage.setItem(FAB_STORAGE_KEY, JSON.stringify({
+                x: fabState.x,
+                y: fabState.y,
+                docked: fabState.docked,
+                collapsed: fabState.collapsed
+            }));
+        } catch (_) {}
+    }
+
+    function fabStatusEl() {
+        let el = document.getElementById('gre-fab-status');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'gre-fab-status';
+            document.body.appendChild(el);
+        }
+        return el;
+    }
+
+    function fabPositionStatus(btn) {
+        const pill = document.getElementById('gre-fab-status');
+        if (!pill) return;
+        const rect = btn.getBoundingClientRect();
+        const left = fabState.x > window.innerWidth / 2
+            ? rect.left - pill.offsetWidth - 10
+            : rect.right + 10;
+        pill.style.left = `${Math.max(6, Math.min(left, window.innerWidth - pill.offsetWidth - 6))}px`;
+        pill.style.top = `${Math.round(rect.top + rect.height / 2 - pill.offsetHeight / 2)}px`;
+    }
+
+    function fabApply(btn, pos, persist = false) {
+        fabState.x = pos.x;
+        fabState.y = pos.y;
+        btn.style.left = `${Math.round(pos.x - FAB_SIZE / 2)}px`;
+        btn.style.top = `${Math.round(pos.y - FAB_SIZE / 2)}px`;
+        fabPositionStatus(btn);
+        if (persist) saveFabState();
+    }
+
+    function fabIsCollapsed(btn) {
+        return btn.classList.contains('gre-collapsed-left') || btn.classList.contains('gre-collapsed-right');
+    }
+
+    function fabExpand(btn) {
+        btn.classList.remove('gre-collapsed-left', 'gre-collapsed-right');
+        fabState.collapsed = false;
+    }
+
+    function fabCollapse(btn) {
+        fabExpand(btn);
+        if (!fabState.docked) return;
+        btn.classList.add(`gre-collapsed-${fabState.docked}`);
+        fabState.collapsed = true;
+        saveFabState();
+    }
+
+    function fabScheduleCollapse(btn) {
+        clearTimeout(fabCollapseTimer);
+        if (!fabState.docked) return;
+        fabCollapseTimer = setTimeout(() => {
+            if (!btn.classList.contains('gre-busy') && !btn.classList.contains('gre-progress') && !btn.matches(':hover')) {
+                fabCollapse(btn);
+            }
+        }, 2500);
+    }
+
+    function setFabStatus(btn, text) {
+        btn.classList.remove('gre-busy', 'gre-progress', 'gre-done', 'gre-error');
+        const ring = btn.querySelector('.gre-fab-ring');
+        const badge = btn.querySelector('.gre-fab-badge');
+        const pill = fabStatusEl();
+        if (text === EXPORT_BUTTON_LABEL) {
+            if (badge) badge.textContent = '';
+            pill.classList.remove('gre-visible');
+            btn.title = `ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION} · 点击导出 · 拖动移动 · 右键重置位置`;
+            fabScheduleCollapse(btn);
+            return;
+        }
+        const progress = /\((\d+)\s*\/\s*(\d+)\)/.exec(text);
+        if (progress && Number(progress[2]) > 0) {
+            const pct = Math.min(100, Math.round((Number(progress[1]) / Number(progress[2])) * 100));
+            btn.classList.add('gre-progress');
+            if (ring) ring.style.setProperty('--gre-pct', String(pct));
+            if (badge) badge.textContent = `${pct}%`;
+        } else if (text.includes('✅')) {
+            btn.classList.add('gre-done');
+            if (badge) badge.textContent = '✓';
+        } else if (text.includes('⚠️')) {
+            btn.classList.add('gre-error');
+            if (badge) badge.textContent = '!';
+        } else {
+            btn.classList.add('gre-busy');
+            if (badge) badge.textContent = '';
+        }
+        btn.title = `${text} · ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION}`;
+        fabExpand(btn);
+        pill.textContent = text;
+        pill.classList.add('gre-visible');
+        fabPositionStatus(btn);
+    }
+
+    function ensureFabStyle() {
+        if (document.getElementById('gre-fab-style')) return;
+        const style = document.createElement('style');
+        style.id = 'gre-fab-style';
+        style.textContent = `
+#gpt-rescue-btn {
+    position: fixed;
+    width: ${FAB_SIZE}px;
+    height: ${FAB_SIZE}px;
+    padding: 0;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 0, 0, .08);
+    background: rgba(255, 255, 255, .88);
+    color: #0d0d0d;
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .16);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: grab;
+    z-index: 99997;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    transition: transform .25s ease, box-shadow .2s ease;
+}
+#gpt-rescue-btn:hover { box-shadow: 0 4px 16px rgba(0, 0, 0, .24); }
+#gpt-rescue-btn.gre-dragging { transition: none; cursor: grabbing; }
+#gpt-rescue-btn:disabled { cursor: default; }
+#gpt-rescue-btn:focus-visible { outline: 2px solid #10a37f; outline-offset: 2px; }
+
+html.dark #gpt-rescue-btn {
+    background: rgba(52, 53, 65, .92);
+    border-color: rgba(255, 255, 255, .14);
+    color: #ececec;
+}
+
+.gre-fab-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity .2s;
+}
+.gre-fab-ring {
+    position: absolute;
+    inset: 2px;
+    border-radius: 999px;
+    opacity: 0;
+    background: conic-gradient(#10a37f calc(var(--gre-pct, 0) * 1%), rgba(0, 0, 0, .12) 0);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3.5px), #000 calc(100% - 3px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 3.5px), #000 calc(100% - 3px));
+    transition: opacity .2s;
+}
+html.dark .gre-fab-ring {
+    background: conic-gradient(#19c37d calc(var(--gre-pct, 0) * 1%), rgba(255, 255, 255, .16) 0);
+}
+.gre-fab-badge {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: -.2px;
+    opacity: 0;
+    transition: opacity .2s;
+}
+#gpt-rescue-btn.gre-progress .gre-fab-ring,
+#gpt-rescue-btn.gre-progress .gre-fab-badge { opacity: 1; }
+#gpt-rescue-btn.gre-progress .gre-fab-icon { opacity: 0; }
+#gpt-rescue-btn.gre-busy .gre-fab-icon { opacity: 0; animation: gre-pulse 1.1s ease-in-out infinite; }
+#gpt-rescue-btn.gre-done { color: #10a37f; }
+#gpt-rescue-btn.gre-error { color: #ef4444; }
+#gpt-rescue-btn.gre-done .gre-fab-icon,
+#gpt-rescue-btn.gre-error .gre-fab-icon { opacity: 0; }
+#gpt-rescue-btn.gre-done .gre-fab-badge,
+#gpt-rescue-btn.gre-error .gre-fab-badge { opacity: 1; }
+
+#gpt-rescue-btn.gre-collapsed-right { transform: translateX(58%); }
+#gpt-rescue-btn.gre-collapsed-left { transform: translateX(-58%); }
+#gpt-rescue-btn.gre-collapsed-right:hover,
+#gpt-rescue-btn.gre-collapsed-left:hover,
+#gpt-rescue-btn.gre-collapsed-right:focus-visible,
+#gpt-rescue-btn.gre-collapsed-left:focus-visible,
+#gpt-rescue-btn.gre-busy,
+#gpt-rescue-btn.gre-progress,
+#gpt-rescue-btn.gre-dragging { transform: none; }
+
+@keyframes gre-pulse {
+    0%, 100% { opacity: 0; }
+    50% { opacity: 1; }
+}
+
+#gre-fab-status {
+    position: fixed;
+    z-index: 99997;
+    max-width: 220px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 0, 0, .08);
+    background: rgba(255, 255, 255, .92);
+    color: #0d0d0d;
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .14);
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.3;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s;
+}
+#gre-fab-status.gre-visible { opacity: 1; }
+html.dark #gre-fab-status {
+    background: rgba(52, 53, 65, .94);
+    border-color: rgba(255, 255, 255, .14);
+    color: #ececec;
+}
+`;
+        document.head.appendChild(style);
+    }
+
+    function createFabButton() {
         let btn = document.getElementById('gpt-rescue-btn');
         if (!btn) {
             btn = document.createElement('button');
             btn.id = 'gpt-rescue-btn';
-            btn.style.display = 'none';
-            btn.textContent = EXPORT_BUTTON_LABEL;
+            btn.type = 'button';
             document.body.appendChild(btn);
+        }
+        // 旧版为文字按钮：清掉遗留的内联样式与文案，重建悬浮球结构
+        if (!btn.querySelector('.gre-fab-ring')) {
+            btn.textContent = '';
+            btn.removeAttribute('style');
+            btn.setAttribute('aria-label', 'ChatGPT Exporter：导出对话');
+            btn.innerHTML = `<span class="gre-fab-ring"></span><span class="gre-fab-icon">${FAB_ICON_SVG}</span><span class="gre-fab-badge"></span>`;
         }
         return btn;
     }
+
+    function bindFabEvents(btn) {
+        if (btn.dataset.fabBound === '1') return;
+        btn.dataset.fabBound = '1';
+
+        btn.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || btn.disabled) return;
+            fabDragInfo = {
+                id: e.pointerId,
+                startX: e.clientX,
+                startY: e.clientY,
+                originX: fabState.x,
+                originY: fabState.y,
+                moved: false
+            };
+            try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+        });
+
+        btn.addEventListener('pointermove', (e) => {
+            if (!fabDragInfo || e.pointerId !== fabDragInfo.id) return;
+            const dx = e.clientX - fabDragInfo.startX;
+            const dy = e.clientY - fabDragInfo.startY;
+            if (!fabDragInfo.moved) {
+                if (Math.hypot(dx, dy) < FAB_DRAG_THRESHOLD) return;
+                fabDragInfo.moved = true;
+                btn.classList.add('gre-dragging');
+                fabExpand(btn);
+                document.getElementById('gre-fab-status')?.classList.remove('gre-visible');
+            }
+            fabApply(btn, fabClamp({ x: fabDragInfo.originX + dx, y: fabDragInfo.originY + dy }));
+        });
+
+        const endDrag = (e) => {
+            if (!fabDragInfo || (e && e.pointerId !== fabDragInfo.id)) return;
+            const wasMoved = fabDragInfo.moved;
+            fabDragInfo = null;
+            btn.classList.remove('gre-dragging');
+            if (!wasMoved) return;
+            fabSuppressClick = true;
+            setTimeout(() => { fabSuppressClick = false; }, 100);
+            fabApply(btn, fabSnap(fabClamp({ x: fabState.x, y: fabState.y })), true);
+            fabScheduleCollapse(btn);
+        };
+        btn.addEventListener('pointerup', endDrag);
+        btn.addEventListener('pointercancel', endDrag);
+
+        btn.addEventListener('pointerenter', () => {
+            clearTimeout(fabCollapseTimer);
+            if (fabIsCollapsed(btn)) fabExpand(btn);
+        });
+        btn.addEventListener('pointerleave', () => fabScheduleCollapse(btn));
+
+        btn.addEventListener('click', (e) => {
+            if (fabSuppressClick) {
+                fabSuppressClick = false;
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+            // 触屏无 hover：收起状态下第一次点按仅展开
+            if (fabIsCollapsed(btn)) {
+                fabExpand(btn);
+                fabScheduleCollapse(btn);
+                return;
+            }
+            if (btn.classList.contains('gre-busy') || btn.classList.contains('gre-progress')) return;
+            showExportDialog();
+        });
+
+        btn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            fabExpand(btn);
+            fabApply(btn, fabSnap(fabClamp(fabDefaultPosition())), true);
+            const pill = fabStatusEl();
+            pill.textContent = '已重置位置';
+            pill.classList.add('gre-visible');
+            fabPositionStatus(btn);
+            setTimeout(() => {
+                if (pill.textContent === '已重置位置') pill.classList.remove('gre-visible');
+            }, 1500);
+        });
+
+        window.addEventListener('resize', () => {
+            if (!document.body.contains(btn)) return;
+            fabApply(btn, fabSnap(fabClamp({ x: fabState.x, y: fabState.y })), true);
+        });
+    }
+
+    function getExportButton() {
+        ensureFabStyle();
+        const btn = createFabButton();
+        bindFabEvents(btn);
+        if (fabState.x == null) {
+            const saved = loadFabState();
+            fabApply(btn, fabSnap(fabClamp(saved ? { x: saved.x, y: saved.y } : fabDefaultPosition())));
+            if (saved && saved.collapsed && fabState.docked) fabCollapse(btn);
+        }
+        if (!btn.disabled) setFabStatus(btn, EXPORT_BUTTON_LABEL);
+        btn.dataset.exporterVersion = ATTACHMENT_EXPORT_VERSION;
+        return btn;
+    }
+
+    function initFab() {
+        if (!document.body) {
+            setTimeout(initFab, 200);
+            return;
+        }
+        getExportButton();
+    }
+
+    // --- 导出流程核心逻辑 ---
 
     async function addConversationToZip(target, convData, workspaceId, report = null) {
         target.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
@@ -626,7 +1030,7 @@
 
         if (!await ensureAccessToken()) {
             btn.disabled = false;
-            btn.textContent = EXPORT_BUTTON_LABEL;
+            setFabStatus(btn, EXPORT_BUTTON_LABEL);
             return;
         }
 
@@ -644,7 +1048,7 @@
                 for (let i = 0; i < conversationEntries.length; i++) {
                     const entry = conversationEntries[i];
                     const label = entry?.title ? entry.title.slice(0, 12) : '对话';
-                    btn.textContent = `📥 ${label} (${i + 1}/${conversationEntries.length})`;
+                    setFabStatus(btn, `📥 ${label} (${i + 1}/${conversationEntries.length})`);
                     const convData = await getConversation(entry.id, workspaceId);
                     const target = entry?.projectTitle
                         ? zip.folder(sanitizeFilename(entry.projectTitle))
@@ -653,25 +1057,25 @@
                     await sleep(jitter());
                 }
             } else {
-                btn.textContent = '📂 获取项目外对话…';
+                setFabStatus(btn, '📂 获取项目外对话…');
                 const orphanIds = await collectIds(btn, workspaceId, null);
                 for (let i = 0; i < orphanIds.length; i++) {
-                    btn.textContent = `📥 根目录 (${i + 1}/${orphanIds.length})`;
+                    setFabStatus(btn, `📥 根目录 (${i + 1}/${orphanIds.length})`);
                     const convData = await getConversation(orphanIds[i], workspaceId);
                     await addConversationToZip(zip, convData, workspaceId, attachmentReport);
                     await sleep(jitter());
                 }
 
-                btn.textContent = '🔍 获取项目列表…';
+                setFabStatus(btn, '🔍 获取项目列表…');
                 const projects = await getProjects(workspaceId);
                 for (const project of projects) {
                     const projectFolder = zip.folder(sanitizeFilename(project.title));
-                    btn.textContent = `📂 项目: ${project.title}`;
+                    setFabStatus(btn, `📂 项目: ${project.title}`);
                     const projectConvIds = await collectIds(btn, workspaceId, project.id);
                     if (projectConvIds.length === 0) continue;
 
                     for (let i = 0; i < projectConvIds.length; i++) {
-                        btn.textContent = `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`;
+                        setFabStatus(btn, `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`);
                         const convData = await getConversation(projectConvIds[i], workspaceId);
                         await addConversationToZip(projectFolder, convData, workspaceId, attachmentReport);
                         await sleep(jitter());
@@ -682,7 +1086,7 @@
             if (attachmentReport) {
                 zip.file('attachment-export-report.json', JSON.stringify(attachmentReport, null, 2));
             }
-            btn.textContent = '📦 生成 ZIP 文件…';
+            setFabStatus(btn, '📦 生成 ZIP 文件…');
             const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
             const date = new Date().toISOString().slice(0, 10);
             const selectionType = exportType || ((Array.isArray(conversationEntries) && conversationEntries.length > 0) ? 'selected' : 'full');
@@ -705,16 +1109,16 @@
                 ? `\n附件：检测 ${attachmentReport.detected}，成功 ${attachmentReport.downloaded}，失败 ${attachmentReport.failed}。`
                 : '';
             alert(`✅ 导出完成！${attachmentSummary}`);
-            btn.textContent = '✅ 完成';
+            setFabStatus(btn, '✅ 完成');
 
         } catch (e) {
             console.error("导出过程中发生严重错误:", e);
             alert(`导出失败: ${e.message}。详情请查看控制台（F12 -> Console）。`);
-            btn.textContent = '⚠️ Error';
+            setFabStatus(btn, '⚠️ Error');
         } finally {
             setTimeout(() => {
                 btn.disabled = false;
-                btn.textContent = EXPORT_BUTTON_LABEL;
+                setFabStatus(btn, EXPORT_BUTTON_LABEL);
             }, 3000);
         }
     }
@@ -885,7 +1289,7 @@
             for (const is_archived of [false, true]) {
                 let offset = 0, has_more = true, page = 0;
                 do {
-                    btn.textContent = `📂 项目外对话 (${is_archived ? 'Archived' : 'Active'} p${++page})`;
+                    setFabStatus(btn, `📂 项目外对话 (${is_archived ? 'Archived' : 'Active'} p${++page})`);
                     const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
                     if (!r.ok) throw new Error(`列举项目外对话列表失败 (${r.status})`);
                     const j = await r.json();
@@ -1658,32 +2062,13 @@
         renderStep('initial');
     }
 
-    function addBtn() {
-        const existing = document.getElementById('gpt-rescue-btn');
-        if (existing) {
-            existing.onclick = showExportDialog;
-            if (!existing.disabled) existing.textContent = EXPORT_BUTTON_LABEL;
-            existing.dataset.exporterVersion = ATTACHMENT_EXPORT_VERSION;
-            existing.title = `ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION}`;
-            return;
-        }
-        const b = document.createElement('button');
-        b.id = 'gpt-rescue-btn';
-        b.textContent = EXPORT_BUTTON_LABEL;
-        Object.assign(b.style, {
-            position: 'fixed', bottom: '24px', right: '24px', zIndex: '99997',
-            padding: '10px 14px', borderRadius: '8px', border: 'none', cursor: 'pointer',
-            fontWeight: 'bold', background: '#10a37f', color: '#fff', fontSize: '14px',
-            boxShadow: '0 3px 12px rgba(0,0,0,.15)', userSelect: 'none'
-        });
-        b.onclick = showExportDialog;
-        b.dataset.exporterVersion = ATTACHMENT_EXPORT_VERSION;
-        b.title = `ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION}`;
-        document.body.appendChild(b);
-    }
-
     // --- 脚本启动 ---
-    setTimeout(addBtn, 2000);
+    // 悬浮导出按钮：页面加载后即可见（点击导出 / 拖动移动 / 贴边半隐藏 / 右键重置）
+    if (document.body) {
+        initFab();
+    } else {
+        document.addEventListener('DOMContentLoaded', initFab);
+    }
 
     window.ChatGPTExporter = window.ChatGPTExporter || {};
     const previousRuntimeVersion = document.documentElement.getAttribute('data-chatgpt-exporter-version');
@@ -1704,13 +2089,6 @@
 
     document.documentElement.setAttribute('data-chatgpt-exporter-ready', '1');
     document.documentElement.setAttribute('data-chatgpt-exporter-version', ATTACHMENT_EXPORT_VERSION);
-    const runtimeButton = document.getElementById('gpt-rescue-btn');
-    if (runtimeButton) {
-        runtimeButton.onclick = showExportDialog;
-        if (!runtimeButton.disabled) runtimeButton.textContent = EXPORT_BUTTON_LABEL;
-        runtimeButton.dataset.exporterVersion = ATTACHMENT_EXPORT_VERSION;
-        runtimeButton.title = `ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION}`;
-    }
     console.info(`[ChatGPT Exporter] runtime v${ATTACHMENT_EXPORT_VERSION} ready`);
     window.dispatchEvent(new CustomEvent('CHATGPT_EXPORTER_READY'));
 
