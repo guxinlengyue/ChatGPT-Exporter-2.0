@@ -179,6 +179,38 @@
         return match ? match[0] : null;
     }
 
+    function getActiveConversationNodes(convData) {
+        const mapping = convData?.mapping;
+        if (!mapping || typeof mapping !== 'object') return [];
+
+        const entries = Object.entries(mapping);
+        if (entries.length === 0) return [];
+
+        let currentNodeId = convData?.current_node;
+        if (!currentNodeId || !mapping[currentNodeId]) {
+            const leaves = entries
+                .filter(([, node]) => !Array.isArray(node?.children) || node.children.length === 0)
+                .sort(([, a], [, b]) => {
+                    const aTime = Number(a?.message?.create_time) || 0;
+                    const bTime = Number(b?.message?.create_time) || 0;
+                    return bTime - aTime;
+                });
+            currentNodeId = leaves[0]?.[0] || entries[entries.length - 1][0];
+            console.warn('Conversation current_node is unavailable; exporting the latest leaf path instead.');
+        }
+
+        const path = [];
+        const visited = new Set();
+        while (currentNodeId && !visited.has(currentNodeId)) {
+            visited.add(currentNodeId);
+            const node = mapping[currentNodeId];
+            if (!node) break;
+            path.push(node);
+            currentNodeId = node.parent || null;
+        }
+        return path.reverse();
+    }
+
     function collectVisibleAttachments(convData) {
         const references = new Map();
         const add = (reference) => {
@@ -188,7 +220,7 @@
             if (!references.has(key)) references.set(key, reference);
         };
 
-        Object.values(convData?.mapping || {}).forEach(node => {
+        getActiveConversationNodes(convData).forEach(node => {
             const message = node?.message;
             if (!message) return;
             const role = message.author?.role;
@@ -349,14 +381,14 @@
             .trim();
     }
 
-    function processContentReferences(text, contentReferences) {
+    function processContentReferences(text, contentReferences, referenceStartIndex = 1) {
         if (!text || !Array.isArray(contentReferences) || contentReferences.length === 0) {
-            return { text, footnotes: [] };
+            return { text, footnotes: [], nextReferenceIndex: referenceStartIndex };
         }
 
         const references = contentReferences.filter(ref => ref && typeof ref.matched_text === 'string' && ref.matched_text.length > 0);
         if (references.length === 0) {
-            return { text, footnotes: [] };
+            return { text, footnotes: [], nextReferenceIndex: referenceStartIndex };
         }
 
         const getReferenceInfo = (ref) => {
@@ -387,7 +419,7 @@
             if (!info.url) return;
             const key = `${info.url}|${info.title}`;
             if (footnoteIndexByKey.has(key)) return;
-            const index = footnotes.length + 1;
+            const index = referenceStartIndex + footnotes.length;
             footnoteIndexByKey.set(key, index);
             footnotes.push({ index, url: info.url, title: info.title, label: info.label });
         });
@@ -429,79 +461,64 @@
             output = output.split(ref.matched_text).join(replacement);
         });
 
-        return { text: output, footnotes };
+        return {
+            text: output,
+            footnotes,
+            nextReferenceIndex: referenceStartIndex + footnotes.length
+        };
     }
 
     function extractConversationMessages(convData, attachmentResult = null) {
-        const mapping = convData?.mapping;
-        if (!mapping) return [];
-
         const messages = [];
-        const mappingKeys = Object.keys(mapping);
-        const rootId = mapping['client-created-root']
-            ? 'client-created-root'
-            : mappingKeys.find(id => !mapping[id]?.parent) || mappingKeys[0];
-        const visited = new Set();
+        const nodes = getActiveConversationNodes(convData);
+        let nextReferenceIndex = 1;
 
-        const traverse = (nodeId) => {
-            if (!nodeId || visited.has(nodeId)) return;
-            visited.add(nodeId);
-            const node = mapping[nodeId];
-            if (!node) return;
+        nodes.forEach(node => {
+            const msg = node?.message;
+            if (!msg) return;
 
-            const msg = node.message;
-            if (msg) {
-                const author = msg.author?.role;
-                const isHidden = msg.metadata?.is_visually_hidden_from_conversation ||
-                    msg.metadata?.is_contextual_answers_system_message;
-                if ((author === 'user' || author === 'assistant') && !isHidden) {
-                    const content = msg.content;
-                    if ((content?.content_type === 'text' || content?.content_type === 'multimodal_text') && Array.isArray(content.parts)) {
-                        const rawText = content.parts
-                            .map(part => typeof part === 'string' ? part : (part?.text ?? ''))
-                            .filter(Boolean)
-                            .join('\n');
-                        const contentReferences = msg.metadata?.content_references || [];
-                        let processedText = rawText;
-                        let footnotes = [];
-                        if (Array.isArray(contentReferences) && contentReferences.length > 0) {
-                            const processed = processContentReferences(rawText, contentReferences);
-                            processedText = processed.text;
-                            footnotes = processed.footnotes;
-                        }
-                        const cleaned = cleanMessageContent(
-                            replaceDownloadedSandboxLinks(processedText, attachmentResult?.sandboxPaths, msg.id)
-                        );
-                        const attachmentLines = (attachmentResult?.files || [])
-                            .filter(file => file.messageId === msg.id && file.kind !== 'sandbox')
-                            .map(file => {
-                                const label = file.name.replace(/[\[\]]/g, '\\$&');
-                                return file.isImage ? `![${label}](${file.path})` : `📎 [${label}](${file.path})`;
-                            });
-                        const renderedContent = [cleaned, ...attachmentLines].filter(Boolean).join('\n\n');
-                        if (renderedContent) {
-                            messages.push({
-                                role: author,
-                                content: renderedContent,
-                                messageId: msg.id,
-                                create_time: msg.create_time || null,
-                                footnotes
-                            });
-                        }
-                    }
-                }
+            const author = msg.author?.role;
+            const isHidden = msg.metadata?.is_visually_hidden_from_conversation ||
+                msg.metadata?.is_contextual_answers_system_message;
+            if ((author !== 'user' && author !== 'assistant') || isHidden) return;
+
+            const content = msg.content;
+            if ((content?.content_type !== 'text' && content?.content_type !== 'multimodal_text') || !Array.isArray(content.parts)) return;
+
+            const rawText = content.parts
+                .map(part => typeof part === 'string' ? part : (part?.text ?? ''))
+                .filter(Boolean)
+                .join('\n');
+            const contentReferences = msg.metadata?.content_references || [];
+            let processedText = rawText;
+            let footnotes = [];
+            if (Array.isArray(contentReferences) && contentReferences.length > 0) {
+                const processed = processContentReferences(rawText, contentReferences, nextReferenceIndex);
+                processedText = processed.text;
+                footnotes = processed.footnotes;
+                nextReferenceIndex = processed.nextReferenceIndex;
             }
 
-            if (Array.isArray(node.children)) {
-                node.children.forEach(childId => traverse(childId));
-            }
-        };
+            const cleaned = cleanMessageContent(
+                replaceDownloadedSandboxLinks(processedText, attachmentResult?.sandboxPaths, msg.id)
+            );
+            const attachmentLines = (attachmentResult?.files || [])
+                .filter(file => file.messageId === msg.id && file.kind !== 'sandbox')
+                .map(file => {
+                    const label = file.name.replace(/[\[\]]/g, '\\$&');
+                    return file.isImage ? `![${label}](${file.path})` : `📎 [${label}](${file.path})`;
+                });
+            const renderedContent = [cleaned, ...attachmentLines].filter(Boolean).join('\n\n');
+            if (!renderedContent) return;
 
-        if (rootId) {
-            traverse(rootId);
-        } else {
-            mappingKeys.forEach(traverse);
-        }
+            messages.push({
+                role: author,
+                content: renderedContent,
+                messageId: msg.id,
+                create_time: msg.create_time || null,
+                footnotes
+            });
+        });
 
         return messages;
     }
